@@ -6,9 +6,9 @@
   "tensor_parallel_size": 2,
   "gpu_memory_utilization": 0.9,
   "max_num_batched_tokens": 8192,
-  "model": "/cognitive_comp/tuxiangqi/models/Qwen3.6-35B-A3B-origin",
-  "source": "/cognitive_comp/songchao/Tool-Rl/ExpertsCall/data/_source",
-  "output": "/cognitive_comp/tuxiangqi/datas/moe_1120",
+  "model": "/home/tuxiangqi/datas/models/Qwen3.6-35B-A3B-origin",
+  "source": "/home/tuxiangqi/datas/prompts",
+  "output": "/cto_labs/tuxiangqi/moe_1125",
   "buckets": ["1-8k", "8-32k", "32-64k", "64-128k", ">128k"],
   "batch_size_by_bucket": {
     "1-8k": 8,
