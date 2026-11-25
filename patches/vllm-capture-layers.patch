@@ -1,0 +1,152 @@
+--- a/vllm/model_executor/layers/fused_moe/expert_prediction_capturer.py
++++ b/vllm/model_executor/layers/fused_moe/expert_prediction_capturer.py
+@@ -19,9 +19,6 @@
+ from vllm.logger import init_logger
+ 
+ logger = init_logger(__name__)
+-
+-CAPTURE_LAYERS = (3, 4, 11, 12, 19, 20, 27, 28)
+-_LAYER_TO_SLOT = {layer: slot for slot, layer in enumerate(CAPTURE_LAYERS)}
+ 
+ _CAPTURER: ExpertPredictionCapturer | None = None
+ 
+@@ -34,12 +31,15 @@
+         num_experts: int,
+         top_k: int,
+         hidden_size: int,
++        capture_layers: tuple[int, ...],
+     ) -> None:
+         device = torch.device("cuda", torch.cuda.current_device())
+         self.num_layers = num_layers
+         self.num_experts = num_experts
+         self.top_k = top_k
+         self.hidden_size = hidden_size
++        self.capture_layers = capture_layers
++        self._layer_to_slot = {layer: slot for slot, layer in enumerate(capture_layers)}
+         self.expert_ids = torch.empty(
+             (max_num_batched_tokens, num_layers, top_k),
+             dtype=torch.int32,
+@@ -56,7 +56,7 @@
+             device=device,
+         )
+         self.hidden = torch.empty(
+-            (max_num_batched_tokens, len(CAPTURE_LAYERS), hidden_size),
++            (max_num_batched_tokens, len(capture_layers), hidden_size),
+             dtype=torch.bfloat16,
+             device=device,
+         )
+@@ -71,7 +71,7 @@
+             num_experts,
+             top_k,
+             hidden_size,
+-            list(CAPTURE_LAYERS),
++            list(capture_layers),
+             max_num_batched_tokens,
+             self._root,
+         )
+@@ -92,7 +92,7 @@
+         scores = self.expert_scores[:n, layer_id]
+         scores.copy_(logits[:n])
+         self.router_weights[:n, layer_id].copy_(topk_weights[:n])
+-        slot = _LAYER_TO_SLOT.get(layer_id)
++        slot = self._layer_to_slot.get(layer_id)
+         if slot is not None:
+             self.hidden[:n, slot].copy_(hidden_states[:n])
+ 
+@@ -141,7 +141,7 @@
+                 (folder / "layers.json").write_text(
+                     json.dumps(
+                         {
+-                            "capture_layers": list(CAPTURE_LAYERS),
++                            "capture_layers": list(self.capture_layers),
+                             "num_layers": self.num_layers,
+                             "num_experts": self.num_experts,
+                             "top_k": self.top_k,
+@@ -162,6 +162,26 @@
+         array.tofile(handle)
+ 
+ 
++def _capture_layers_from_env(num_layers: int) -> tuple[int, ...]:
++    raw = os.environ.get("MOE_CAPTURE_LAYERS")
++    if raw is None:
++        raise ValueError("MOE_CAPTURE_LAYERS is required when MoE capture is enabled")
++    try:
++        layers = json.loads(raw)
++    except ValueError as exc:
++        raise ValueError("MOE_CAPTURE_LAYERS must be a JSON array of layer IDs") from exc
++    if (
++        not isinstance(layers, list)
++        or not layers
++        or any(type(layer) is not int or not 0 <= layer < num_layers for layer in layers)
++        or len(set(layers)) != len(layers)
++    ):
++        raise ValueError(
++            f"MOE_CAPTURE_LAYERS must contain unique layer IDs in 0..{num_layers - 1}"
++        )
++    return tuple(layers)
++
++
+ def maybe_bind_expert_prediction(model: torch.nn.Module, vllm_config) -> None:
+     global _CAPTURER
+     if os.environ.get("MOE_PREDICTION_CAPTURE") != "1":
+@@ -174,30 +194,34 @@
+     )
+ 
+     model_config = vllm_config.model_config
++    num_layers = int(model_config.get_total_num_hidden_layers())
++    capture_layers = _capture_layers_from_env(num_layers)
+     num_experts = int(model_config.get_num_experts())
+     top_k = int(model_config.get_num_experts_per_tok())
+     hidden_size = int(model_config.get_hidden_size())
+     max_tokens = int(vllm_config.scheduler_config.max_num_batched_tokens)
++    runners = [
++        module for module in model.modules()
++        if isinstance(module, MoERunner) and isinstance(module.router, FusedMoERouter)
++    ]
++    bound = sorted(int(module.layer_id) for module in runners)
++    if bound != list(range(num_layers)):
++        raise RuntimeError(f"expected MoE layers 0..{num_layers - 1}, found {bound}")
+     capturer = ExpertPredictionCapturer(
+         max_num_batched_tokens=max_tokens,
+-        num_layers=40,
++        num_layers=num_layers,
+         num_experts=num_experts,
+         top_k=top_k,
+         hidden_size=hidden_size,
++        capture_layers=capture_layers,
+     )
+-    bound: list[int] = []
+-    for module in model.modules():
+-        if isinstance(module, MoERunner) and isinstance(module.router, FusedMoERouter):
+-            layer_id = int(module.layer_id)
+-            module.router.set_prediction_fn(
+-                lambda hidden, logits, ids, weights, layer_id=layer_id: (
+-                    capturer.capture(layer_id, hidden, logits, ids, weights)
+-                )
++    for module in runners:
++        layer_id = int(module.layer_id)
++        module.router.set_prediction_fn(
++            lambda hidden, logits, ids, weights, layer_id=layer_id: (
++                capturer.capture(layer_id, hidden, logits, ids, weights)
+             )
+-            bound.append(layer_id)
+-    bound.sort()
+-    if bound != list(range(40)):
+-        raise RuntimeError(f"expected MoE layers 0..39, found {bound}")
++        )
+     _CAPTURER = capturer
+ 
+ 
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -2460,6 +2460,10 @@
+ 
+         factors[factor] = normalize_value(raw)
+ 
++    # Capture changes the compiled forward graph, including the order of slots.
++    if os.environ.get("MOE_PREDICTION_CAPTURE") == "1":
++        factors["MOE_CAPTURE_LAYERS"] = os.environ.get("MOE_CAPTURE_LAYERS")
++
+     ray_noset_env_vars = [
+         # Refer to
+         # https://github.com/ray-project/ray/blob/c584b1ea97b00793d1def71eaf81537d70efba42/python/ray/_private/accelerators/nvidia_gpu.py#L11

@@ -1,0 +1,22 @@
+{
+  "per_bucket": 1500,
+  "max_new_tokens": 32768,
+  "max_context": 262144,
+  "seed": 0,
+  "tensor_parallel_size": 2,
+  "gpu_memory_utilization": 0.9,
+  "max_num_batched_tokens": 8192,
+  "model": "/cognitive_comp/tuxiangqi/models/Qwen3.6-35B-A3B-origin",
+  "source": "/cognitive_comp/songchao/Tool-Rl/ExpertsCall/data/_source",
+  "output": "/cognitive_comp/tuxiangqi/datas/moe_1120",
+  "buckets": ["1-8k", "8-32k", "32-64k", "64-128k", ">128k"],
+  "batch_size_by_bucket": {
+    "1-8k": 8,
+    "8-32k": 4,
+    "32-64k": 2,
+    "64-128k": 2,
+    ">128k": 1
+  },
+  "capture_layers": [4,  12,  20,  28,  36,  39 ],
+  "eog_token_ids": [248046, 248044]
+}
