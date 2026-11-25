@@ -16,7 +16,7 @@ def task_devices(devices: list[str], tp: int, local_rank: int) -> list[str]:
         raise ValueError("require allocated GPUs and TP_SIZE 2 or 4")
     if len(devices) == tp:
         return devices
-    # --gpu-bind=none exposes all allocated GPUs on this node.
+    # Some configurations expose all allocated GPUs on the node to each task.
     if len(devices) % tp or (local_rank + 1) * tp > len(devices):
         raise ValueError(f"cannot assign local task {local_rank} TP{tp} from {devices}")
     return devices[local_rank * tp:(local_rank + 1) * tp]

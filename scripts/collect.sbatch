@@ -9,7 +9,6 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --mem-per-cpu=6G
 #SBATCH --time=7-00:00:00
-#SBATCH --chdir=/cognitive_comp/tuxiangqi/workspace/data_generate
 #SBATCH --output=slurm-collect-%j.out
 
 set -euo pipefail
@@ -18,7 +17,6 @@ export CONFIG="${CONFIG:-$PWD/config/collect.json}"
 export TP_SIZE="${TP_SIZE:-${SLURM_GPUS_PER_TASK:-2}}"
 export PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}"
 export PYTHONUNBUFFERED=1
-export MOE_PREDICTION_CAPTURE=1
 export VLLM_USE_FLASHINFER_SAMPLER=0
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
@@ -38,6 +36,6 @@ flock -n 9 || { echo 'Another collection job holds this output directory' >&2; e
 export PLAN="${PLAN:-$COLLECT_OUTPUT/selection.jsonl}"
 "$PYTHON" -m data_generate.collect prepare --config "$CONFIG" --plan "$PLAN"
 echo "nodes=$SLURM_NNODES instances=$SLURM_NTASKS TP=$TP_SIZE plan=$PLAN"
-# Each task selects a local TP group from this node's allocated GPUs.
-srun --ntasks="$SLURM_NTASKS" --gpus-per-task="$TP_SIZE" --gpu-bind=none --kill-on-bad-exit=1 \
+# Slurm requests one GPU group per task. The launcher also handles node-wide visibility.
+srun --ntasks="$SLURM_NTASKS" --gpus-per-task="$TP_SIZE" --kill-on-bad-exit=1 \
     "$PYTHON" scripts/collection_node.py

@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 from collections import Counter, defaultdict, deque
 import fcntl
+from importlib.metadata import PackageNotFoundError, version
 from itertools import chain
 import json
 import os
@@ -161,8 +162,10 @@ def check_context_budget(llm, config: dict, batch: list[dict]) -> None:
     if not capacity or not block:
         raise RuntimeError("cannot verify batch budget: profiled KV capacity is unavailable")
     lengths = [record["prompt_len"] + config["max_new_tokens"] for record in batch]
-    if any(length > config["max_context"] for length in lengths):
-        raise RuntimeError(f"request exceeds max_context after generation allowance: {lengths}")
+    if any(length >= config["max_context"] for length in lengths):
+        raise RuntimeError(
+            f"request must leave one context slot after generation allowance: {lengths}"
+        )
     reserved = sum(((length + block - 1) // block) * block for length in lengths)
     usable = int(capacity * 0.9)
     print(f"context_budget prompt_lengths={[r['prompt_len'] for r in batch]} "
@@ -177,7 +180,8 @@ def check_context_budget(llm, config: dict, batch: list[dict]) -> None:
 
 
 def prompt_fits(prompt_len: int, config: dict) -> bool:
-    return prompt_len + config["max_new_tokens"] <= config["max_context"]
+    # vLLM reserves one slot for the sample discarded after the final forward.
+    return prompt_len + config["max_new_tokens"] < config["max_context"]
 
 
 def iter_bucket_files(source: Path, bucket: str) -> list[Path]:
@@ -377,7 +381,15 @@ def sampling_params(config: dict, max_new_tokens: int, **extra):
 
 
 def make_engine(config: dict, collect_dir: Path):
-    os.environ["MOE_PREDICTION_CAPTURE"] = "1"
+    try:
+        vllm_version = version("vllm")
+    except PackageNotFoundError as exc:
+        raise RuntimeError("Install the upstream vLLM 0.32.0 wheel in the collection environment") from exc
+    if vllm_version.partition("+")[0] != "0.32.0":
+        raise RuntimeError(f"MoE collection supports upstream vLLM 0.32.0, found {vllm_version}")
+    if not config.get("enforce_eager", True):
+        raise ValueError("The MoE collection plugin requires enforce_eager=true")
+    os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "1"
     os.environ["MOE_COLLECT_DIR"] = str(collect_dir)
     os.environ["MOE_CAPTURE_LAYERS"] = json.dumps(config["capture_layers"])
     os.environ.setdefault("MOE_REPEAT_PERIOD_MAX", "512")
@@ -396,7 +408,9 @@ def make_engine(config: dict, collect_dir: Path):
         max_num_seqs=int(config.get("max_num_seqs", 1)),
         max_num_batched_tokens=int(config["max_num_batched_tokens"]),
         trust_remote_code=True,
-        enforce_eager=bool(config.get("enforce_eager", False)),
+        enforce_eager=True,
+        worker_cls="data_generate.vllm_worker.CaptureWorker",
+        scheduler_cls="data_generate.vllm_scheduler.CaptureScheduler",
         enable_trace_replay=True,
     )
 
