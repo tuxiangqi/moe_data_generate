@@ -8,22 +8,21 @@
 
 从仓库根目录运行。示例适用于 Linux x86_64（glibc 2.28 或更新版）。用 `nvidia-smi` 检查驱动与可用 GPU，建议使用原生支持 CUDA 12.9 的驱动。预编译 wheel 安装无需编译 vLLM。[vLLM 0.32.0 GPU 安装文档](https://docs.vllm.ai/en/v0.32.0/getting_started/installation/gpu/)
 
-如果尚未安装 uv，按 [uv 官方安装说明](https://docs.astral.sh/uv/getting-started/installation/) 安装。然后执行：
+安装 uv 0.13.7 或兼容的更新版本，然后在仓库根目录执行：
 
 ```bash
-uv --version
-uv python install 3.12
-uv venv --python 3.12 .venv
-
-uv pip install --python .venv/bin/python \
-  'vllm==0.32.0+cu129' \
-  --extra-index-url https://wheels.vllm.ai/0.32.0/cu129 \
-  --torch-backend=cu129
-
-uv pip check --python .venv/bin/python
+uv sync --locked
 ```
 
-仓库脚本会将本项目的 `src/` 加到 Python 搜索路径。使用干净的新环境，避免继承指向其他 vLLM 源码树的 `PYTHONPATH`。在有 GPU 的机器或 Slurm GPU allocation 内检查版本和 CUDA：
+`pyproject.toml` 和 `uv.lock` 固定了 vLLM、PyTorch CUDA 12.9 构建和传递依赖。`uv sync --locked` 使用仓库指定的 Python 3.12，在当前机器重建 `.venv`。换机器时带上仓库及锁文件，然后填本机的模型、输入和输出路径。[uv 安装说明](https://docs.astral.sh/uv/getting-started/installation/)
+
+锁文件使用 PyPI、vLLM 官方 wheel 和 PyTorch cu129 三个源。如果机器预设了 uv 镜像变量，先用项目指定的源同步：
+
+```bash
+env -u UV_DEFAULT_INDEX -u UV_INDEX_URL -u UV_INDEX -u UV_EXTRA_INDEX_URL uv sync --locked
+```
+
+在有 GPU 的机器或 Slurm GPU allocation 内检查版本和 CUDA：
 
 ```bash
 nvidia-smi
