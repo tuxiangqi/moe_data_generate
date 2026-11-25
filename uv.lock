@@ -374,10 +374,10 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "numpy" },
-    { name = "torch", specifier = "==2.13.0+cu129", index = "https://download.pytorch.org/whl/cu129" },
-    { name = "torchaudio", specifier = "==2.11.0+cu129", index = "https://download.pytorch.org/whl/cu129" },
-    { name = "torchcodec", specifier = "==0.16.0+cu129", index = "https://download.pytorch.org/whl/cu129" },
-    { name = "torchvision", specifier = "==0.28.0+cu129", index = "https://download.pytorch.org/whl/cu129" },
+    { name = "torch", index = "https://download.pytorch.org/whl/cu129" },
+    { name = "torchaudio", index = "https://download.pytorch.org/whl/cu129" },
+    { name = "torchcodec", index = "https://download.pytorch.org/whl/cu129" },
+    { name = "torchvision", index = "https://download.pytorch.org/whl/cu129" },
     { name = "transformers" },
     { name = "vllm", specifier = "==0.32.0+cu129", index = "https://wheels.vllm.ai/0.32.0/cu129" },
 ]

@@ -14,7 +14,7 @@
 uv sync --locked
 ```
 
-`pyproject.toml` 和 `uv.lock` 固定了 vLLM、PyTorch CUDA 12.9 构建和传递依赖。`uv sync --locked` 使用仓库指定的 Python 3.12，在当前机器重建 `.venv`。换机器时带上仓库及锁文件，然后填本机的模型、输入和输出路径。[uv 安装说明](https://docs.astral.sh/uv/getting-started/installation/)
+`pyproject.toml` 指定 vLLM 0.32.0 和 cu129 wheel 源，由 vLLM 的依赖约束选择 PyTorch 版本。`uv.lock` 保存解析结果，让裸机与 Slurm 安装相同版本。`uv sync --locked` 使用仓库指定的 Python 3.12，在当前机器重建 `.venv`。换机器时带上仓库及锁文件，然后填本机的模型、输入和输出路径。[uv 安装说明](https://docs.astral.sh/uv/getting-started/installation/)
 
 锁文件使用 PyPI、vLLM 官方 wheel 和 PyTorch cu129 三个源。如果机器预设了 uv 镜像变量，先用项目指定的源同步：
 
