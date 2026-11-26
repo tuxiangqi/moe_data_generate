@@ -1,4 +1,4 @@
-"""One batch per real bucket, with production batching and generation settings."""
+"""Validate a few full prompts per bucket with production collection settings."""
 
 import argparse
 import json
@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from data_generate.collect import (
-    bucket_batch_sizes, collection_settings, encode_prompt, iter_bucket_files,
+    collection_settings, encode_prompt, iter_bucket_files,
     load_config, prompt_fits, run_collection,
 )
 
@@ -18,14 +18,17 @@ from data_generate.collect import (
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--per-bucket", type=int, default=2)
     args = parser.parse_args()
+    if args.per_bucket < 1:
+        parser.error("--per-bucket must be positive")
     args.output.mkdir(parents=True, exist_ok=False)
     config = load_config(ROOT / "config/collect.json")
     config["output"] = str(args.output)
     (args.output / "config.json").write_text(json.dumps(config, indent=2))
-    sizes = bucket_batch_sizes(config)
+    count = args.per_bucket
     plan = args.output / "selection.jsonl"
-    report = {"status": "running", "batches": {}, "config": config}
+    report = {"status": "running", "buckets": {}, "config": config}
     report_path = args.output / "validation.json"
 
     def save():
@@ -39,7 +42,7 @@ def main():
 
         tokenizer = AutoTokenizer.from_pretrained(config["model"], trust_remote_code=True)
         with plan.open("w", encoding="utf-8") as handle:
-            for bucket, count in sizes.items():
+            for bucket in config["buckets"]:
                 selected, seen = [], set()
                 for path in iter_bucket_files(Path(config["source"]), bucket):
                     with path.open(encoding="utf-8") as source:
@@ -63,20 +66,18 @@ def main():
                         break
                 if len(selected) != count:
                     raise RuntimeError(f"{bucket}: cannot find {count} eligible full prompts")
-                report["batches"][bucket] = {
-                    "batch_size": count, "prompt_lengths": [r["prompt_len"] for r in selected],
-                    "worst_case_context_tokens": sum(r["prompt_len"] + config["max_new_tokens"]
-                                                     for r in selected),
+                report["buckets"][bucket] = {
+                    "prompt_lengths": [r["prompt_len"] for r in selected],
                 }
-                print(f"selected {bucket}: {report['batches'][bucket]}", flush=True)
+                print(f"selected {bucket}: {report['buckets'][bucket]}", flush=True)
                 for record in selected:
                     handle.write(json.dumps(record) + "\n")
                 save()
         run_collection(config, plan)
-        for bucket in sizes:
+        for bucket in config["buckets"]:
             metas = [json.loads(p.read_text()) for p in (args.output / bucket).glob("*/meta.json")]
-            assert len(metas) == sizes[bucket], (bucket, len(metas))
-            report["batches"][bucket]["results"] = metas
+            assert len(metas) == count, (bucket, len(metas))
+            report["buckets"][bucket]["results"] = metas
         report["status"] = "passed"
         save()
         print("bucket validation passed", flush=True)

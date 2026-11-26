@@ -39,8 +39,9 @@ def main():
     command = [sys.executable, "-m", "data_generate.collect", "run",
                "--config", str(config_path), "--plan", os.environ["PLAN"],
                "--tp-size", str(tp), "--shard-index", str(rank), "--num-shards", str(tasks)]
-    if os.environ.get("BATCH_SIZE"):
-        command.extend(["--batch-size", os.environ["BATCH_SIZE"]])
+    max_num_seqs = os.environ.get("MAX_NUM_SEQS") or os.environ.get("BATCH_SIZE")
+    if max_num_seqs:
+        command.extend(["--max-num-seqs", max_num_seqs])
     print(json.dumps({"shard": rank, "num_shards": tasks, "gpus": visible,
                       "command": command}), flush=True)
     if args.dry_run:

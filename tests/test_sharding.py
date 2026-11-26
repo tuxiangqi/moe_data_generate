@@ -11,8 +11,8 @@ from unittest.mock import Mock, patch
 import numpy as np
 
 from data_generate.collect import (
-    check_context_budget, collection_settings, completed_record, generate_batch,
-    iter_plan, prepare_plan, record_domain, select_records, validate_inputs,
+    collection_concurrency, collection_settings, completed_record, generate_batch,
+    iter_completed_requests, iter_plan, prepare_plan, record_domain, select_records, validate_inputs,
 )
 
 
@@ -48,14 +48,48 @@ class ShardingTests(unittest.TestCase):
             with self.assertRaisesRegex(NotADirectoryError, "output is not a directory"):
                 validate_inputs(config)
 
-    def test_kv_budget_reserves_decode_tokens_and_block_rounding(self):
-        cache = SimpleNamespace(kv_cache_size_tokens=1000, effective_attention_block_size=16)
-        llm = SimpleNamespace(llm_engine=SimpleNamespace(vllm_config=SimpleNamespace(cache_config=cache)))
-        batch = [{"bucket": "test", "prompt_len": 100}] * 2
-        # Prefill alone fits; reserving generation makes this batch unsafe.
-        with self.assertRaises(RuntimeError):
-            check_context_budget(llm, {"max_new_tokens": 400, "max_context": 600}, batch)
-        check_context_budget(llm, {"max_new_tokens": 200, "max_context": 600}, batch)
+    def test_continuous_collection_refills_across_buckets_under_kv_budget(self):
+        cache = SimpleNamespace(kv_cache_size_tokens=100, effective_attention_block_size=16)
+        engine = Mock()
+        engine.vllm_config.cache_config = cache
+        llm = Mock(llm_engine=engine)
+        llm.enqueue.side_effect = [["0-aaa"], ["1-bbb"], ["2-ccc"], ["3-ddd"]]
+        records = [
+            {"id": str(i), "bucket": bucket, "prompt_len": length, "token_ids": [i] * length}
+            for i, (bucket, length) in enumerate([("a", 36), ("a", 18), ("b", 20), ("b", 13)])
+        ]
+        finished = lambda i: SimpleNamespace(
+            request_id=str(i), prompt_token_ids=records[i]["token_ids"], finished=True
+        )
+        admissions = []
+
+        def step():
+            admissions.append(llm.enqueue.call_count)
+            return [finished([1, 0, 3, 2][len(admissions) - 1])]
+
+        engine.step.side_effect = step
+        config = {"max_new_tokens": 5, "max_context": 100, "max_num_seqs": 3}
+        results = iter_completed_requests(llm, config, records, "params")
+        first = next(results)
+        self.assertEqual(first[2], "1-bbb")
+        self.assertEqual(llm.enqueue.call_count, 3)
+        self.assertEqual(admissions, [2])  # 48 + 32 + 32 would exceed the 90-token budget.
+        self.assertEqual([(r["id"], internal) for r, _, internal in results],
+                         [("0", "0-aaa"), ("3", "3-ddd"), ("2", "2-ccc")])
+        self.assertEqual(admissions, [2, 3, 4, 4])
+
+    def test_request_too_large_for_kv_budget_is_rejected_before_enqueue(self):
+        llm = Mock()
+        llm.llm_engine.vllm_config.cache_config = SimpleNamespace(
+            kv_cache_size_tokens=100, effective_attention_block_size=16
+        )
+        record = {"id": "long", "bucket": "test", "prompt_len": 80, "token_ids": [1] * 80}
+        config = {"max_new_tokens": 5, "max_context": 100}
+        with self.assertRaisesRegex(RuntimeError, "needs 96 KV tokens"):
+            list(iter_completed_requests(llm, config, [record], "params"))
+        llm.enqueue.assert_not_called()
+        self.assertEqual(collection_concurrency({"buckets": ["a", "b"],
+                                                "batch_size_by_bucket": {"a": 4, "b": 1}}), 4)
 
     def test_batch_preserves_request_order_and_limits(self):
         prompts = [[1, 2], [3, 4, 5]]

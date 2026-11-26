@@ -72,7 +72,7 @@ config.update(
     max_new_tokens=32,
     per_bucket=1,
     buckets=["1-8k"],
-    batch_size_by_bucket={"1-8k": 1},
+    max_num_seqs=1,
     enforce_eager=True,
 )
 Path("data/collect.quickstart.json").write_text(json.dumps(config, indent=2) + "\n")
@@ -82,6 +82,8 @@ export CONFIG="$PWD/data/collect.quickstart.json"
 ```
 
 使用真实语料时，`source` 指向按 bucket 分目录的数据根目录。各 bucket 下的 `natural.json` 是 JSON Lines，每行至少包含 `id` 和 `prompt`。修改采集配置时给 `output` 用新目录，避免混用旧计划和旧结果。生产运行前先小规模验证显存和磁盘占用。
+
+长度桶用于选样和组织输出。采集时，任一请求结束即可补入下一条，vLLM 在每步按 `max_num_batched_tokens` 调度分块 prefill 与 decode。`max_num_seqs` 控制每个 TP 实例的在途请求上限。采集器按 vLLM 实测的 KV 容量预留 10% 余量，并按请求的 prompt 和完整生成额度预留 KV 空间，因此长请求的实际并发数可能更低。Slurm 可以用 `MAX_NUM_SEQS` 覆盖此上限，旧的 `BATCH_SIZE` 仍可用。旧配置只有 `batch_size_by_bucket` 时，以其中最大值作为全局并发上限。
 
 ## 裸机 4090
 

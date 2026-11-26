@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter, defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor
 import fcntl
 from importlib.metadata import PackageNotFoundError, version
 from itertools import chain
@@ -54,7 +55,7 @@ def load_config(path: Path) -> dict:
             or any(type(layer) is not int or not 0 <= layer < NUM_LAYERS for layer in layers)
             or len(set(layers)) != len(layers)):
         raise ValueError(f"capture_layers must contain unique layer IDs in 0..{NUM_LAYERS - 1}")
-    bucket_batch_sizes(config)
+    collection_concurrency(config)
     return config
 
 
@@ -126,57 +127,79 @@ def validate_inputs(config: dict) -> None:
         raise NotADirectoryError(f"output is not a directory: {output}")
 
 
-def bucket_batch_sizes(config: dict) -> dict[str, int]:
-    sizes = config.get("batch_size_by_bucket")
-    if sizes is None:
-        sizes = {bucket: config.get("max_num_seqs", 1) for bucket in config["buckets"]}
-    if set(sizes) != set(config["buckets"]):
-        raise ValueError("batch_size_by_bucket must cover exactly the configured buckets")
-    for bucket, size in sizes.items():
-        if type(size) is not int or size < 1:
-            raise ValueError(f"batch size for {bucket} must be a positive integer")
-    return dict(sizes)
+def collection_concurrency(config: dict) -> int:
+    limit = config.get("max_num_seqs", 8)
+    if "max_num_seqs" not in config and "batch_size_by_bucket" in config:
+        sizes = config["batch_size_by_bucket"]
+        if (not isinstance(sizes, dict) or not sizes or set(sizes) != set(config["buckets"])
+                or any(type(size) is not int or size < 1 for size in sizes.values())):
+            raise ValueError("batch_size_by_bucket must specify a positive limit for each bucket")
+        limit = max(sizes.values())
+    if type(limit) is not int or limit < 1:
+        raise ValueError("max_num_seqs must be a positive integer")
+    return limit
 
 
-def iter_record_batches(records, sizes: dict[str, int]):
-    """Keep each batch within one bucket, including after resume filtering."""
-    batch = []
-    for record in records:
-        bucket = record["bucket"]
-        if batch and batch[0]["bucket"] != bucket:
-            yield batch
-            batch = []
-        batch.append(record)
-        if len(batch) == sizes[bucket]:
-            yield batch
-            batch = []
-    if batch:
-        yield batch
-
-
-def check_context_budget(llm, config: dict, batch: list[dict]) -> None:
-    """Reserve the full generation allowance, using profiled hybrid KV capacity."""
-    cache = llm.llm_engine.vllm_config.cache_config
+def iter_completed_requests(llm, config: dict, records, params):
+    """Refill the vLLM queue as requests finish, reserving their full KV budgets."""
+    engine = llm.llm_engine
+    cache = engine.vllm_config.cache_config
     capacity = cache.kv_cache_size_tokens
     block = cache.effective_attention_block_size
     if not capacity or not block:
-        raise RuntimeError("cannot verify batch budget: profiled KV capacity is unavailable")
-    lengths = [record["prompt_len"] + config["max_new_tokens"] for record in batch]
-    if any(length >= config["max_context"] for length in lengths):
-        raise RuntimeError(
-            f"request must leave one context slot after generation allowance: {lengths}"
-        )
-    reserved = sum(((length + block - 1) // block) * block for length in lengths)
+        raise RuntimeError("cannot verify request budget: profiled KV capacity is unavailable")
     usable = int(capacity * 0.9)
-    print(f"context_budget prompt_lengths={[r['prompt_len'] for r in batch]} "
-          f"with_generation={lengths} block_rounded_total={reserved} "
-          f"profiled_kv_capacity={capacity} usable_with_margin={usable}", flush=True)
-    if reserved > usable:
-        raise RuntimeError(
-            f"batch needs {reserved} KV tokens including full generation allowance; "
-            f"profiled capacity with 10% margin is {usable}. "
-            f"Reduce batch_size_by_bucket[{batch[0]['bucket']!r}] explicitly."
-        )
+    limit = collection_concurrency(config)
+    print(f"context_budget profiled_kv_capacity={capacity} usable_with_margin={usable} "
+          f"block_size={block}", flush=True)
+
+    def with_reservations():
+        for record in records:
+            length = record["prompt_len"] + config["max_new_tokens"]
+            if not prompt_fits(record["prompt_len"], config):
+                raise RuntimeError(f"{record['bucket']}/{record['id']}: request must leave one "
+                                   f"context slot after generation allowance ({length} tokens)")
+            reserve = ((length + block - 1) // block) * block
+            if reserve > usable:
+                raise RuntimeError(f"{record['bucket']}/{record['id']} needs {reserve} KV tokens "
+                                   f"including generation; capacity with 10% margin is {usable}")
+            yield record, reserve
+
+    pending = with_reservations()
+    next_request = next(pending, None)
+    in_flight = {}
+    reserved = 0
+    completed = []
+    while next_request is not None or in_flight or completed:
+        while next_request is not None and len(in_flight) < limit:
+            record, reserve = next_request
+            if reserved + reserve > usable:
+                break
+            (internal_id,) = llm.enqueue(
+                {"prompt_token_ids": record["token_ids"]}, params, use_tqdm=False
+            )
+            # vLLM 0.32 returns the internal ID from enqueue and the numeric
+            # external ID from step. The capture directory uses the internal ID.
+            external_id = internal_id.partition("-")[0]
+            if external_id in in_flight:
+                raise RuntimeError(f"duplicate vLLM request ID {external_id}")
+            in_flight[external_id] = record, reserve, internal_id
+            reserved += reserve
+            next_request = next(pending, None)
+        yield from completed
+        completed.clear()
+        if not in_flight:
+            break
+        if not engine.has_unfinished_requests():
+            raise RuntimeError(f"vLLM lost unfinished requests: {list(in_flight)}")
+        for output in engine.step():
+            if not output.finished:
+                continue
+            record, reserve, internal_id = in_flight.pop(output.request_id)
+            reserved -= reserve
+            if list(output.prompt_token_ids) != record["token_ids"]:
+                raise RuntimeError(f"vLLM output prompt mismatch for {record['bucket']}/{record['id']}")
+            completed.append((record, output, internal_id))
 
 
 def prompt_fits(prompt_len: int, config: dict) -> bool:
@@ -437,8 +460,11 @@ def locate_capture_dir(collect_dir: Path, request_id: str) -> Path:
     )
 
 
-def finish_request(config: dict, collect_dir: Path, output, prompt_ids: list[int], max_new_tokens: int | None):
-    folder = locate_capture_dir(collect_dir, output.request_id)
+def finish_request(config: dict, collect_dir: Path, output, prompt_ids: list[int],
+                   max_new_tokens: int | None, *, capture_id: str | None = None):
+    folder = collect_dir / capture_id if capture_id is not None else locate_capture_dir(
+        collect_dir, output.request_id
+    )
     stop = json.loads((folder / "stop.json").read_text(encoding="utf-8"))
     generated = list(output.outputs[0].token_ids)
     validate_capture(
@@ -509,6 +535,7 @@ def run_smoke(config: dict) -> None:
     # Short prompts only. Keep the context small so the smoke engine does not
     # reserve the full 256k KV cache.
     config["max_context"] = 4096
+    config["max_num_seqs"] = 1
     tokenizer = AutoTokenizer.from_pretrained(config["model"], trust_remote_code=True)
     prompt = first_short_prompt(config, tokenizer)
     smoke_root = Path(config["output"]) / "_smoke"
@@ -734,11 +761,9 @@ def run_collection(config: dict, plan: Path | None = None,
     if not 0 <= shard_index < num_shards:
         raise ValueError("require 0 <= shard_index < num_shards")
     config = dict(config)
-    sizes = bucket_batch_sizes(config)
-    # One engine serves all buckets; the actual submitted batch follows sizes.
-    config["max_num_seqs"] = max(sizes.values())
+    config["max_num_seqs"] = collection_concurrency(config)
     print(f"shard={shard_index}/{num_shards} TP={config['tensor_parallel_size']} "
-          f"batch_size_by_bucket={sizes}", flush=True)
+          f"max_num_seqs={config['max_num_seqs']}", flush=True)
     output = Path(config["output"])
     output.mkdir(parents=True, exist_ok=True)
     if plan is None:
@@ -746,6 +771,7 @@ def run_collection(config: dict, plan: Path | None = None,
             raise ValueError("parallel collection requires a prepared --plan")
         plan = output / "selection.jsonl"
         prepare_plan(config, plan)
+
     def pending_records():
         for record in iter_plan(plan, shard_index, num_shards):
             if record["collection_settings"] != collection_settings(config):
@@ -755,8 +781,8 @@ def run_collection(config: dict, plan: Path | None = None,
             else:
                 yield record
 
-    batches = iter_record_batches(pending_records(), sizes)
-    first = next(batches, None)
+    records = pending_records()
+    first = next(records, None)
     if first is None:
         return
     active_root = output / "_active"
@@ -764,30 +790,36 @@ def run_collection(config: dict, plan: Path | None = None,
     active = Path(tempfile.mkdtemp(prefix=f"shard-{shard_index}-", dir=active_root))
     llm = make_engine(config, active)
     run_id = os.environ.get("SLURM_JOB_ID", active.name)
-    for batch in chain((first,), batches):
-        print(f"collect bucket={batch[0]['bucket']} batch={len(batch)} "
-              f"target_batch={sizes[batch[0]['bucket']]} "
-              f"prompt_tokens={sum(record['prompt_len'] for record in batch)}", flush=True)
-        check_context_budget(llm, config, batch)
-        metas = generate_batch(
-            llm, config, active, [record["token_ids"] for record in batch],
-            sampling_params(config, config["max_new_tokens"]),
-            [config["max_new_tokens"]] * len(batch),
-        )
-        for record, meta in zip(batch, metas):
-            bucket = record["bucket"]
-            dest = output / bucket / record["id"]
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            src = active / meta["request_id"]
-            meta.update(corpus_id=record["id"], source_meta=record["meta"],
-                        collection_settings=collection_settings(config))
-            (src / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
-            src.rename(dest)
-            manifest = output / bucket / "manifests" / f"{run_id}-shard-{shard_index}.jsonl"
-            manifest.parent.mkdir(parents=True, exist_ok=True)
-            with manifest.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps({"corpus_id": record["id"], "stop_reason": meta["stop_reason"]}) + "\n")
-            print(bucket, record["id"], meta["stop_reason"], meta["generated_len"], flush=True)
+
+    def publish(record, result, internal_id):
+        meta = finish_request(config, active, result, record["token_ids"],
+                              config["max_new_tokens"], capture_id=internal_id)
+        bucket = record["bucket"]
+        dest = output / bucket / record["id"]
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        src = active / internal_id
+        meta.update(corpus_id=record["id"], source_meta=record["meta"],
+                    collection_settings=collection_settings(config))
+        (src / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+        src.rename(dest)
+        manifest = output / bucket / "manifests" / f"{run_id}-shard-{shard_index}.jsonl"
+        manifest.parent.mkdir(parents=True, exist_ok=True)
+        with manifest.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"corpus_id": record["id"], "stop_reason": meta["stop_reason"]}) + "\n")
+        print(bucket, record["id"], meta["stop_reason"], meta["generated_len"], flush=True)
+
+    params = sampling_params(config, config["max_new_tokens"])
+    results = iter_completed_requests(llm, config, chain((first,), records), params)
+    writes = deque()
+    with ThreadPoolExecutor(max_workers=1) as writer:
+        for result in results:
+            while writes and writes[0].done():
+                writes.popleft().result()
+            if len(writes) >= config["max_num_seqs"]:
+                writes.popleft().result()
+            writes.append(writer.submit(publish, *result))
+        for write in writes:
+            write.result()
 
 
 def main() -> None:
@@ -797,7 +829,7 @@ def main() -> None:
     parser.add_argument("--shard-index", type=int, default=0)
     parser.add_argument("--num-shards", type=int, default=1)
     parser.add_argument("--tp-size", type=int)
-    parser.add_argument("--batch-size", type=int)
+    parser.add_argument("--max-num-seqs", "--batch-size", type=int)
     parser.add_argument(
         "--config",
         type=Path,
@@ -814,13 +846,10 @@ def main() -> None:
         return
     if args.tp_size is not None:
         config["tensor_parallel_size"] = args.tp_size
-    if args.batch_size is not None:
-        if args.batch_size < 1:
-            parser.error("--batch-size must be positive")
-        config["max_num_seqs"] = args.batch_size
-        config["batch_size_by_bucket"] = {
-            bucket: args.batch_size for bucket in config["buckets"]
-        }
+    if args.max_num_seqs is not None:
+        if args.max_num_seqs < 1:
+            parser.error("--max-num-seqs must be positive")
+        config["max_num_seqs"] = args.max_num_seqs
     if args.command == "prepare":
         if args.plan is None:
             parser.error("prepare requires --plan")

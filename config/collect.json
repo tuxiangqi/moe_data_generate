@@ -10,13 +10,7 @@
   "source": "/home/tuxiangqi/datas/prompts",
   "output": "/cto_labs/tuxiangqi/moe_1125",
   "buckets": ["1-8k", "8-32k", "32-64k", "64-128k", ">128k"],
-  "batch_size_by_bucket": {
-    "1-8k": 8,
-    "8-32k": 4,
-    "32-64k": 2,
-    "64-128k": 2,
-    ">128k": 1
-  },
+  "max_num_seqs": 8,
   "capture_layers": [4,  12,  20,  28,  36,  39 ],
   "eog_token_ids": [248046, 248044]
 }
