@@ -20,6 +20,8 @@ from pathlib import Path
 
 import numpy as np
 
+from .capture_writer import wait_for_capture
+
 NUM_LAYERS = 40
 TOP_K = 8
 NUM_EXPERTS = 256
@@ -419,7 +421,10 @@ def make_engine(config: dict, collect_dir: Path):
     os.environ.setdefault("MOE_REPEAT_MIN_TOKENS", "96")
     os.environ.setdefault("MOE_REPEAT_DIVERSITY_WINDOW", "2048")
     os.environ.setdefault("MOE_REPEAT_DIVERSITY_MAX", "64")
-    from vllm import LLM
+    from vllm import LLM, envs
+
+    if not envs.VLLM_ENABLE_V1_MULTIPROCESSING:
+        raise RuntimeError("Buffered MoE capture requires vLLM engine multiprocessing")
 
     return LLM(
         model=config["model"],
@@ -465,6 +470,7 @@ def finish_request(config: dict, collect_dir: Path, output, prompt_ids: list[int
     folder = collect_dir / capture_id if capture_id is not None else locate_capture_dir(
         collect_dir, output.request_id
     )
+    wait_for_capture(folder)
     stop = json.loads((folder / "stop.json").read_text(encoding="utf-8"))
     generated = list(output.outputs[0].token_ids)
     validate_capture(

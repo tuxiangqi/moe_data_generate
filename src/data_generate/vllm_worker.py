@@ -69,11 +69,17 @@ class CaptureModelRunner(GPUModelRunner):
             scheduler_output, intermediate_tensors, dummy_run=dummy_run, **kwargs
         )
         if not dummy_run:
-            for req_id in scheduler_output.finished_req_ids:
-                self._capturer.forget(req_id)
+            self._capturer.finish_requests(scheduler_output.finished_req_ids)
             if scheduler_output.total_num_scheduled_tokens:
                 self._capturer.flush(self.execute_model_state.input_batch)
         return output
+
+    def shutdown(self) -> None:
+        try:
+            if capturer := getattr(self, "_capturer", None):
+                capturer.close()
+        finally:
+            super().shutdown()
 
 
 class CaptureWorker(Worker):

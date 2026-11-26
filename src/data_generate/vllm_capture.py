@@ -8,12 +8,14 @@ import logging
 import os
 from pathlib import Path
 
-import numpy as np
 import torch
 
 from vllm.distributed.parallel_state import get_tp_group
 
+from .capture_writer import BufferedCaptureWriter
+
 logger = logging.getLogger(__name__)
+
 
 class ExpertPredictionCapturer:
     def __init__(
@@ -28,9 +30,6 @@ class ExpertPredictionCapturer:
         device = torch.device("cuda", torch.cuda.current_device())
         self.num_layers = num_layers
         self.num_experts = num_experts
-        self.top_k = top_k
-        self.hidden_size = hidden_size
-        self.capture_layers = capture_layers
         self._layer_to_slot = {layer: slot for slot, layer in enumerate(capture_layers)}
         self.expert_ids = torch.empty(
             (max_num_batched_tokens, num_layers, top_k),
@@ -57,6 +56,17 @@ class ExpertPredictionCapturer:
         self.rows_by_layer: dict[int, int] = {}
         self._root = Path(os.environ["MOE_COLLECT_DIR"])
         self._root.mkdir(parents=True, exist_ok=True)
+        layers = {
+            "capture_layers": list(capture_layers),
+            "num_layers": num_layers,
+            "num_experts": num_experts,
+            "top_k": top_k,
+            "hidden_size": hidden_size,
+        }
+        self._writer = (
+            BufferedCaptureWriter(self._root, json.dumps(layers))
+            if get_tp_group().is_first_rank else None
+        )
         logger.info(
             "MoE prediction capture: layers=%d experts=%d topk=%d hidden=%d "
             "capture_layers=%s max_tokens=%d dir=%s",
@@ -90,11 +100,18 @@ class ExpertPredictionCapturer:
         if slot is not None:
             self.hidden[:n, slot].copy_(hidden_states[:n])
 
-    def forget(self, request_id: str) -> None:
-        self._cursor.pop(request_id, None)
+    def finish_requests(self, request_ids: set[str]) -> None:
+        if self._writer is not None:
+            captured = [request_id for request_id in request_ids
+                        if self._cursor.pop(request_id, None) is not None]
+            self._writer.finish(captured)
+
+    def close(self) -> None:
+        if self._writer is not None:
+            self._writer.close()
 
     def flush(self, input_batch) -> None:
-        if not get_tp_group().is_first_rank:
+        if self._writer is None:
             return
         query = input_batch.query_start_loc_np
         starts = input_batch.num_computed_tokens_np
@@ -121,10 +138,9 @@ class ExpertPredictionCapturer:
             hidden_cpu = hidden.to("cpu", non_blocking=True)
             event.record(self._copy_stream)
         event.synchronize()
-        ids_np = ids_cpu.numpy()
-        scores_np = scores_cpu.numpy()
-        weights_np = weights_cpu.numpy()
-        hidden_np = hidden_cpu.view(torch.uint16).numpy()
+        arrays = (ids_cpu.numpy(), scores_cpu.numpy(), weights_cpu.numpy(),
+                  hidden_cpu.view(torch.uint16).numpy())
+        chunks = {}
         for i, req_id in enumerate(input_batch.req_ids):
             begin = int(query[i])
             end = int(query[i + 1])
@@ -138,31 +154,9 @@ class ExpertPredictionCapturer:
                     f"MoE capture gap for {req_id}: file has {seen} tokens, "
                     f"this step starts at {token_start}"
                 )
-            folder = self._root / req_id
-            folder.mkdir(parents=True, exist_ok=True)
-            if not (folder / "layers.json").exists():
-                (folder / "layers.json").write_text(
-                    json.dumps(
-                        {
-                            "capture_layers": list(self.capture_layers),
-                            "num_layers": self.num_layers,
-                            "num_experts": self.num_experts,
-                            "top_k": self.top_k,
-                            "hidden_size": self.hidden_size,
-                        }
-                    ),
-                    encoding="utf-8",
-                )
-            _append(folder / "expert_ids.bin", ids_np[begin:end])
-            _append(folder / "expert_scores.bin", scores_np[begin:end])
-            _append(folder / "router_weights_topk.bin", weights_np[begin:end])
-            _append(folder / "hidden_states.bin", hidden_np[begin:end])
+            chunks[req_id] = tuple(array[begin:end] for array in arrays)
             self._cursor[req_id] = seen + rows
-
-
-def _append(path: Path, array: np.ndarray) -> None:
-    with path.open("ab") as handle:
-        array.tofile(handle)
+        self._writer.submit(chunks)
 
 
 def capture_layers_from_env(num_layers: int) -> tuple[int, ...]:
